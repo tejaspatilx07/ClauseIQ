@@ -648,7 +648,7 @@ if uploaded_file:
         progress_bar = st.progress(0, text="🗂️ Agent 0 — Detecting document type...")
 
         try:
-            with st.spinner("⚙️ Running 5-agent pipeline — this takes 15–30 seconds..."):
+            with st.spinner("⚙️ Running pipeline — this takes ~40 seconds on free tier. Please wait…"):
                 result = analyze_document(doc_text, language)
 
             progress_bar.progress(100, text="✅ All agents complete!")
