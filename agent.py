@@ -1,14 +1,20 @@
 """
 agent.py — ClauseIQ Multi-Agent Backend
-Groq Llama 3.3 70B · 6-Agent Pipeline for Indian Legal Documents
+Groq Llama 3.1 8B (fast) + Llama 3.3 70B (heavy) · 6-Agent Pipeline for Indian Legal Documents
 
 Agents:
-  0 — Document Type Detector
-  1 — Clause Extractor (context-aware)
-  2 — Risk Evaluator (context-aware)
-  3 — Legal Advisor + Indian Law Citations + Decision Engine
-  4 — Negotiation Script Generator (WhatsApp & Email)
-  5 — Consumer Court Motion Drafter (CPA 2019)
+  0 — Document Type Detector          → llama-3.1-8b-instant   (fast, separate quota)
+  1 — Clause Extractor (context-aware) → llama-3.1-8b-instant   (fast, separate quota)
+  2 — Risk Evaluator (context-aware)   → llama-3.3-70b-versatile
+  3 — Legal Advisor + Indian Law Citations + Decision Engine → llama-3.3-70b-versatile
+  4 — Negotiation Script Generator (WhatsApp & Email)        → llama-3.3-70b-versatile
+  5 — Consumer Court Motion Drafter (CPA 2019)               → llama-3.3-70b-versatile
+
+Rate-limit strategy (Groq free tier):
+  - Agents 0 & 1 use llama-3.1-8b-instant (~14,400 tok/min) — separate bucket from 70B
+  - Agents 2–5 use llama-3.3-70b-versatile (~6,000 tok/min)
+  - 8-second sleep between every agent call lets counters partially reset
+  - Total pipeline: ~40s on free tier instead of crashing
 """
 
 import time
@@ -45,13 +51,21 @@ def _get_groq_client() -> Groq:
     return Groq(api_key=api_key.strip())
 
 
-MODEL = "llama-3.3-70b-versatile"
+# ─────────────────────────────────────────────
+# MODEL SELECTION
+# Two separate Groq rate-limit buckets on free tier:
+#   - 8B instant:      ~14,400 tokens/min  → Agents 0, 1
+#   - 70B versatile:    ~6,000 tokens/min  → Agents 2, 3, 4, 5
+# ─────────────────────────────────────────────
+MODEL_FAST  = "llama-3.1-8b-instant"      # Agents 0, 1
+MODEL_HEAVY = "llama-3.3-70b-versatile"   # Agents 2, 3, 4, 5
+
+# Seconds to sleep between agent calls so Groq token counters can reset
+_INTER_AGENT_DELAY = 8
 
 
 # ─────────────────────────────────────────────
 # AGENT 0 — Document Type Detector
-# Detects doc type so downstream agents apply
-# the right context-aware risk lens.
 # ─────────────────────────────────────────────
 DOC_TYPE_PROMPT = """You are a legal document classifier for Indian legal documents.
 Read the document and determine its type.
@@ -168,7 +182,6 @@ FINAL_DECISION_END"""
 
 # ─────────────────────────────────────────────
 # AGENT 4 — Negotiation Script Generator
-# Writes ready-to-send email/WhatsApp messages
 # ─────────────────────────────────────────────
 def build_negotiation_prompt(language: str, doc_type: str) -> str:
     lang_instruction = (
@@ -204,8 +217,6 @@ Be tactful. The goal is to negotiate, not to threaten. The person still wants a 
 
 # ─────────────────────────────────────────────
 # AGENT 5 — Consumer Court Motion Drafter
-# Generates a formal complaint under CPA 2019
-# Self-representation allowed under CPC Order 3
 # ─────────────────────────────────────────────
 CONSUMER_MOTION_PROMPT = """You are Agent 5: Consumer Court Motion Drafter.
 You help Indian citizens file complaints before the District Consumer Disputes Redressal Commission (DCDRC) under the Consumer Protection Act 2019.
@@ -269,19 +280,21 @@ def run_agent(
     user_content: str,
     retries: int = 2,
     max_tokens: int = 2000,
+    model: str = MODEL_HEAVY,
 ) -> str:
     """
     Call Groq API with a system + user message.
-    Retries on transient errors with exponential backoff.
-    Raises RuntimeError with user-friendly messages on failure.
+    - model: pass MODEL_FAST for Agents 0/1, MODEL_HEAVY for Agents 2-5
+    - Retries on transient errors with exponential backoff.
+    - Raises RuntimeError with user-friendly messages on failure.
     """
-    client = _get_groq_client()   # validates key on every call; cheap dict lookup
+    client = _get_groq_client()
     last_error = None
 
     for attempt in range(retries + 1):
         try:
             response = client.chat.completions.create(
-                model=MODEL,
+                model=model,
                 max_tokens=max_tokens,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -304,11 +317,14 @@ def run_agent(
             # Rate limit — back off and retry
             if "rate_limit" in err_str or "429" in err_str:
                 if attempt < retries:
-                    time.sleep(4 * (attempt + 1))
+                    wait = 15 * (attempt + 1)   # 15s, then 30s
+                    time.sleep(wait)
                     continue
                 raise RuntimeError(
-                    "⚠️ **Groq rate limit reached.** Please wait 10–15 seconds and try again. "
-                    "The free tier has per-minute limits."
+                    "⚠️ **Groq rate limit reached.** The free tier has per-minute token limits.\n\n"
+                    "**Try:** Wait 30 seconds and re-upload your document.\n"
+                    "**Or:** Use a shorter document (remove cover pages, indexes, boilerplate).\n"
+                    "**Tip:** The pipeline needs ~40 seconds to complete — avoid clicking twice."
                 ) from e
 
             # Context / token length errors
@@ -335,6 +351,15 @@ def run_agent(
 def analyze_document(doc_text: str, language: str = "English") -> dict:
     """
     Full 4-agent pipeline with doc type detection.
+
+    Model assignment:
+      Agent 0, 1 → MODEL_FAST  (llama-3.1-8b-instant,  ~14,400 tok/min free)
+      Agent 2, 3 → MODEL_HEAVY (llama-3.3-70b-versatile, ~6,000 tok/min free)
+
+    _INTER_AGENT_DELAY seconds of sleep between each call lets Groq's
+    per-minute token counters partially reset, preventing rate-limit errors
+    on the free tier without requiring a paid key.
+
     Returns dict with all agent outputs.
     Raises RuntimeError with a user-friendly message on failure.
     """
@@ -352,50 +377,63 @@ def analyze_document(doc_text: str, language: str = "English") -> dict:
         )
 
     # ── Agent 0 — Detect Document Type ──────────────────────────────
+    # Uses MODEL_FAST — only needs 3000 chars of context, 8B handles it fine
     try:
         doc_meta_raw = run_agent(
             DOC_TYPE_PROMPT,
-            f"Classify this legal document:\n\n{doc_text[:3000]}"
+            f"Classify this legal document:\n\n{doc_text[:3000]}",
+            model=MODEL_FAST,
         )
         doc_meta = parse_doc_meta(doc_meta_raw)
         doc_type = doc_meta.get("DOC_TYPE", "Other")
     except RuntimeError:
         raise
     except Exception:
-        # Non-critical — fall back gracefully
         doc_meta_raw = "DOC_TYPE: Other\nPARTIES: Unknown\nJURISDICTION: India (General)\nSUMMARY: Legal document"
         doc_meta = parse_doc_meta(doc_meta_raw)
         doc_type = "Other"
 
+    time.sleep(_INTER_AGENT_DELAY)   # let token counter breathe
+
     # ── Agent 1 — Extract Clauses (context-aware) ───────────────────
+    # Uses MODEL_FAST — structured extraction, no deep reasoning needed
     try:
         clauses_raw = run_agent(
             build_clause_analyzer_prompt(doc_type),
-            f"Extract all clauses from this {doc_type}:\n\n{doc_text}"
+            f"Extract all clauses from this {doc_type}:\n\n{doc_text}",
+            model=MODEL_FAST,
         )
     except RuntimeError:
         raise
     except Exception as e:
         raise RuntimeError(f"❌ Clause extraction failed unexpectedly: {e}") from e
 
+    time.sleep(_INTER_AGENT_DELAY)
+
     # ── Agent 2 — Evaluate Risk (context-aware) ─────────────────────
+    # Uses MODEL_HEAVY — needs legal judgment, not just pattern matching
     try:
         risks_raw = run_agent(
             build_risk_evaluator_prompt(doc_type),
-            f"Evaluate risk for each clause in this {doc_type}:\n\n{clauses_raw}"
+            f"Evaluate risk for each clause in this {doc_type}:\n\n{clauses_raw}",
+            model=MODEL_HEAVY,
         )
     except RuntimeError:
         raise
     except Exception as e:
         raise RuntimeError(f"❌ Risk evaluation failed unexpectedly: {e}") from e
 
+    time.sleep(_INTER_AGENT_DELAY)
+
     # ── Agent 3 — Advise + Law Citations + Final Decision ───────────
+    # Uses MODEL_HEAVY — Indian law citations + nuanced advice
     try:
         advisor_prompt = build_advisor_prompt(language, doc_type)
         final_raw = run_agent(
             advisor_prompt,
             f"Generate advice, Indian law citations, and final decision for these clauses:\n\n{risks_raw}",
-            max_tokens=3000
+            max_tokens=3000,
+            model=MODEL_HEAVY,
         )
     except RuntimeError:
         raise
@@ -423,6 +461,7 @@ def generate_negotiation_scripts(
     """
     Agent 4: Generates negotiation WhatsApp + Email scripts
     for all HIGH and MEDIUM risk clauses.
+    Uses MODEL_HEAVY — tone and persuasion quality matters here.
     """
     risky_clauses = [c for c in clauses if c.get("RISK") in ("HIGH", "MEDIUM")]
     if not risky_clauses:
@@ -439,7 +478,8 @@ def generate_negotiation_scripts(
         return run_agent(
             build_negotiation_prompt(language, doc_type),
             f"Write negotiation scripts for these risky clauses:\n\n{clause_summary}",
-            max_tokens=3000
+            max_tokens=3000,
+            model=MODEL_HEAVY,
         )
     except RuntimeError:
         raise
@@ -471,7 +511,8 @@ Be direct. No filler."""
         return run_agent(
             prompt,
             f"Risk summary for signing as-is:\n\n{doc_text[:1500]}",
-            max_tokens=400
+            max_tokens=400,
+            model=MODEL_HEAVY,
         )
     except RuntimeError:
         raise
@@ -498,6 +539,7 @@ def generate_consumer_motion(
     """
     Agent 5: Drafts a Consumer Forum complaint under CPA 2019.
     The complainant can self-represent per Order III CPC.
+    Uses MODEL_HEAVY — formal legal drafting requires precision.
     """
     high_clauses = [c for c in clauses if c.get("RISK") == "HIGH"]
     clause_summary = ""
@@ -530,6 +572,7 @@ DOCUMENT EXCERPT (first 1200 chars):
             CONSUMER_MOTION_PROMPT,
             user_content,
             max_tokens=1800,
+            model=MODEL_HEAVY,
         )
     except RuntimeError:
         raise
