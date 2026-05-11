@@ -61,7 +61,17 @@ MODEL_FAST  = "llama-3.1-8b-instant"      # Agents 0, 1
 MODEL_HEAVY = "llama-3.3-70b-versatile"   # Agents 2, 3, 4, 5
 
 # Seconds to sleep between agent calls so Groq token counters can reset
-_INTER_AGENT_DELAY = 8
+_INTER_AGENT_DELAY = 15
+
+# Max characters sent to each agent — keeps token usage under free-tier limits
+# ~4 chars per token on average for English legal text
+# Agent 0: 3000 chars  → ~750 tokens  (just needs to classify)
+# Agent 1: 6000 chars  → ~1500 tokens (clause extraction — most important cap)
+# Agent 2: 8000 chars  → ~2000 tokens (risk eval gets clause list, not full doc)
+# Agent 3: 8000 chars  → ~2000 tokens (advisor gets risk list, not full doc)
+_DOC_CAP_AGENT0 = 3000
+_DOC_CAP_AGENT1 = 6000
+_CLAUSE_CAP     = 8000   # cap on clauses_raw / risks_raw passed between agents
 
 
 # ─────────────────────────────────────────────
@@ -381,7 +391,7 @@ def analyze_document(doc_text: str, language: str = "English") -> dict:
     try:
         doc_meta_raw = run_agent(
             DOC_TYPE_PROMPT,
-            f"Classify this legal document:\n\n{doc_text[:3000]}",
+            f"Classify this legal document:\n\n{doc_text[:_DOC_CAP_AGENT0]}",
             model=MODEL_FAST,
         )
         doc_meta = parse_doc_meta(doc_meta_raw)
@@ -400,7 +410,7 @@ def analyze_document(doc_text: str, language: str = "English") -> dict:
     try:
         clauses_raw = run_agent(
             build_clause_analyzer_prompt(doc_type),
-            f"Extract all clauses from this {doc_type}:\n\n{doc_text}",
+            f"Extract all clauses from this {doc_type}:\n\n{doc_text[:_DOC_CAP_AGENT1]}",
             model=MODEL_FAST,
         )
     except RuntimeError:
@@ -415,7 +425,7 @@ def analyze_document(doc_text: str, language: str = "English") -> dict:
     try:
         risks_raw = run_agent(
             build_risk_evaluator_prompt(doc_type),
-            f"Evaluate risk for each clause in this {doc_type}:\n\n{clauses_raw}",
+            f"Evaluate risk for each clause in this {doc_type}:\n\n{clauses_raw[:_CLAUSE_CAP]}",
             model=MODEL_HEAVY,
         )
     except RuntimeError:
@@ -431,7 +441,7 @@ def analyze_document(doc_text: str, language: str = "English") -> dict:
         advisor_prompt = build_advisor_prompt(language, doc_type)
         final_raw = run_agent(
             advisor_prompt,
-            f"Generate advice, Indian law citations, and final decision for these clauses:\n\n{risks_raw}",
+            f"Generate advice, Indian law citations, and final decision for these clauses:\n\n{risks_raw[:_CLAUSE_CAP]}",
             max_tokens=3000,
             model=MODEL_HEAVY,
         )
